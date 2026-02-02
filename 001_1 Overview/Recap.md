@@ -4,8 +4,13 @@
 
 ### Проверка системы
 ```bash
+# Memory
+free
+
 # Версия ОС
-cat /etc/centos-release
+cat /etc/os-release
+hostnamectl
+uname -a
 
 # Проверка свободных портов
 sudo ss -tulpn | grep -E ':(5433|7000|9000)'
