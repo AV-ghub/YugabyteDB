@@ -1,6 +1,6 @@
 ```
 # 1. Останавливаем НЕ основной TServer (не yb-tserver1!)
-docker-compose stop yb-tserver2
+docker-compose stop yb-tserver3
 
 # docker-compose ps
          Name                       Command                State                                                                       Ports
