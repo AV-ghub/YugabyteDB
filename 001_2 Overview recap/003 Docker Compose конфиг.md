@@ -1,3 +1,66 @@
+### docker-compose.yml
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Главный узел управления
+  yb-master:
+    image: yugabytedb/yugabyte:latest
+    command:
+      - "/home/yugabyte/bin/yb-master"
+      - "--fs_data_dirs=/mnt/master"
+      - "--master_addresses=yb-master:7100"
+      - "--rpc_bind_addresses=yb-master:7100"
+      - "--replication_factor=1"  # КРИТИЧЕСКИ ВАЖНО для локального теста!
+    mem_limit: 1024m
+    ports:
+      - "7000:7000"  # Веб-интерфейс
+
+  # Три узла данных (TServer)
+  yb-tserver1:
+    image: yugabytedb/yugabyte:latest
+    command:
+      - "/home/yugabyte/bin/yb-tserver"
+      - "--fs_data_dirs=/mnt/tserver"
+      - "--tserver_master_addrs=yb-master:7100"
+      - "--rpc_bind_addresses=yb-tserver1:9100"
+      - "--enable_ysql"
+      - "--ysql_enable_auth=false"
+      - "--pgsql_proxy_bind_address=0.0.0.0:5433"
+    ports:
+      - "5433:5433"  # PostgreSQL-совместимый порт
+    depends_on:
+      - yb-master
+    mem_limit: 2048m  # Минимум 2 ГБ!
+
+  yb-tserver2:
+    image: yugabytedb/yugabyte:latest
+    command:
+      - "/home/yugabyte/bin/yb-tserver"
+      - "--fs_data_dirs=/mnt/tserver"
+      - "--tserver_master_addrs=yb-master:7100"
+      - "--rpc_bind_addresses=yb-tserver2:9100"
+      - "--enable_ysql"
+      - "--ysql_enable_auth=false"
+    depends_on:
+      - yb-master
+    mem_limit: 2048m
+
+  yb-tserver3:
+    image: yugabytedb/yugabyte:latest
+    command:
+      - "/home/yugabyte/bin/yb-tserver"
+      - "--fs_data_dirs=/mnt/tserver"
+      - "--tserver_master_addrs=yb-master:7100"
+      - "--rpc_bind_addresses=yb-tserver3:9100"
+      - "--enable_ysql"
+      - "--ysql_enable_auth=false"
+    depends_on:
+      - yb-master
+    mem_limit: 2048m
+```
+
 ### ⚙️ Параметры Мастера-узла (YB-Master)
 Мастер — это «мозг» кластера, он управляет **метаданными**, но не хранит пользовательские данные.
 
