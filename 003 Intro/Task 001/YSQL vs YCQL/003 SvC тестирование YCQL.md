@@ -1010,3 +1010,223 @@ GROUP BY bucket;
 5. **Параллелизм**: Несколько потоков/процессов увеличат скорость
 
 Какой объем данных вы хотите вставить для теста? Начните с 100K строк через Python скрипт - это займет 1-2 минуты и покажет принцип.
+
+---------------------------------------------------------------------------------
+
+```
+вот так
+[root@mongo-db3 yugabyte]# docker exec -it yugabyte_yb-tserver1_1 bash -c "
+> echo 'Creating CSV file...'
+> echo 'bucket,item_id,value,payload' > /tmp/bulk_data.csv
+> for i in \$(seq 1 100000); do
+>   bucket=\$((i % 1000))
+>   item_id=\"item_\$i\"
+>   value=\$(echo \"scale=2; \$RANDOM/327.67\" | bc)
+>   payload=\"payload_\$i\"
+>   echo \"\$bucket,\$item_id,\$value,\$payload\" >> /tmp/bulk_data.csv
+> done
+> echo 'CSV created with 100K rows'
+> "
+Creating CSV file...
+bash: line 6: bc: command not found
+bash: line 6: bc: command not found
+```
+
+Проблема в том, что в контейнере YugabyteDB нет утилиты `bc`. Давайте упростим генерацию и используем другие методы.
+
+## 🚀 Упрощенная генерация данных
+
+### Вариант 1: Генерация без `bc` (используем bash-арифметику)
+
+```bash
+docker exec -it yugabyte_yb-tserver1_1 bash -c "
+echo 'Creating CSV file...'
+echo 'bucket,item_id,value,payload' > /tmp/bulk_data.csv
+for i in \$(seq 1 100000); do
+  bucket=\$((i % 1000))
+  item_id=\"item_\$i\"
+  # Используем целые числа для упрощения
+  value=\$((RANDOM % 10000))  # 0-9999
+  payload=\"payload_\$i\"
+  echo \"\$bucket,\$item_id,\$value,\$payload\" >> /tmp/bulk_data.csv
+done
+echo 'CSV created with 100K rows'
+echo 'First 3 lines:'
+head -3 /tmp/bulk_data.csv
+"
+```
+
+### Вариант 2: Используем Python для генерации (надежнее)
+
+```bash
+docker exec -it yugabyte_yb-tserver1_1 python3 << 'EOF'
+import random
+import csv
+
+print("Creating CSV file with Python...")
+with open('/tmp/bulk_data.csv', 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['bucket', 'item_id', 'value', 'payload'])
+    
+    for i in range(1, 100001):
+        bucket = i % 1000
+        item_id = f'item_{i}'
+        value = round(random.random() * 100, 2)  # случайное float
+        payload = f'payload_{i}'
+        writer.writerow([bucket, item_id, value, payload])
+        
+        if i % 10000 == 0:
+            print(f"Generated {i} rows...")
+
+print("CSV created with 100K rows")
+print("First 3 lines:")
+with open('/tmp/bulk_data.csv', 'r') as f:
+    for _ in range(3):
+        print(f.readline().strip())
+EOF
+```
+
+## 📥 Загрузка данных в YCQL
+
+### Метод A: Используем COPY команду (самый простой)
+
+```bash
+# Загружаем через ycqlsh
+docker exec -it yugabyte_yb-tserver1_1 /home/yugabyte/bin/ycqlsh -e "
+USE stress;
+COPY ycql_perf_test (bucket, item_id, value, payload) 
+FROM '/tmp/bulk_data.csv' 
+WITH HEADER = true 
+AND MAXATTEMPTS = 5 
+AND CHUNKSIZE = 1000 
+AND INGESTRATE = 1000;
+"
+```
+
+### Метод B: Простой Python-скрипт для вставки
+
+```bash
+docker exec -it yugabyte_yb-tserver1_1 python3 << 'EOF'
+from cassandra.cluster import Cluster
+from cassandra.query import SimpleStatement
+import csv
+import time
+
+print("Connecting to YugabyteDB...")
+cluster = Cluster(['127.0.0.1'], port=9042)
+session = cluster.connect('stress')
+
+print("Starting bulk insert...")
+start_time = time.time()
+rows_inserted = 0
+
+with open('/tmp/bulk_data.csv', 'r') as f:
+    reader = csv.reader(f)
+    next(reader)  # Skip header
+    
+    batch_size = 100
+    batch_values = []
+    
+    for row in reader:
+        batch_values.append(row)
+        
+        if len(batch_values) >= batch_size:
+            # Создаем batch INSERT
+            values_str = ', '.join([f"({v[0]}, '{v[1]}', {v[2]}, '{v[3]}')" for v in batch_values])
+            query = f"INSERT INTO ycql_perf_test (bucket, item_id, value, payload) VALUES {values_str}"
+            
+            try:
+                session.execute(query)
+                rows_inserted += len(batch_values)
+            except Exception as e:
+                print(f"Error: {e}")
+                # Вставка по одной при ошибке
+                for v in batch_values:
+                    try:
+                        session.execute(
+                            "INSERT INTO ycql_perf_test (bucket, item_id, value, payload) VALUES (%s, %s, %s, %s)",
+                            (int(v[0]), v[1], float(v[2]), v[3])
+                        )
+                        rows_inserted += 1
+                    except:
+                        pass
+            
+            batch_values = []
+            
+            if rows_inserted % 10000 == 0:
+                elapsed = time.time() - start_time
+                rate = rows_inserted / elapsed
+                print(f"Inserted {rows_inserted:,} rows, rate: {rate:,.0f} rows/sec")
+
+# Остаточные записи
+if batch_values:
+    values_str = ', '.join([f"({v[0]}, '{v[1]}', {v[2]}, '{v[3]}')" for v in batch_values])
+    query = f"INSERT INTO ycql_perf_test (bucket, item_id, value, payload) VALUES {values_str}"
+    session.execute(query)
+    rows_inserted += len(batch_values)
+
+total_time = time.time() - start_time
+print(f"\nDone! Inserted {rows_inserted:,} rows in {total_time:.2f} seconds")
+print(f"Average rate: {rows_inserted/total_time:,.0f} rows/sec")
+EOF
+```
+
+## 🎯 Быстрый тест с минимальными данными (для проверки)
+
+Если вам нужно просто проверить работу, вот самый быстрый способ:
+
+```bash
+# 1. Создаем маленький тестовый файл (1000 строк)
+docker exec -it yugabyte_yb-tserver1_1 python3 << 'EOF'
+import csv, random
+with open('/tmp/test_small.csv', 'w') as f:
+    writer = csv.writer(f)
+    writer.writerow(['bucket', 'item_id', 'value', 'payload'])
+    for i in range(1, 1001):
+        writer.writerow([i%100, f'item_{i}', random.random()*100, f'payload_{i}'])
+print("Created test_small.csv with 1000 rows")
+EOF
+
+# 2. Загружаем через ycqlsh
+docker exec -it yugabyte_yb-tserver1_1 /home/yugabyte/bin/ycqlsh -e "
+USE stress;
+COPY ycql_perf_test (bucket, item_id, value, payload) 
+FROM '/tmp/test_small.csv' 
+WITH HEADER = true;
+"
+
+# 3. Проверяем
+docker exec -it yugabyte_yb-tserver1_1 /home/yugabyte/bin/ycqlsh -e "
+USE stress;
+SELECT COUNT(*) FROM ycql_perf_test;
+SELECT * FROM ycql_perf_test WHERE bucket = 1 LIMIT 3;
+"
+```
+
+## 🔧 Проверка и диагностика
+
+Если что-то не работает, проверьте:
+
+```bash
+# 1. Есть ли таблица?
+docker exec -it yugabyte_yb-tserver1_1 /home/yugabyte/bin/ycqlsh -e "DESC TABLE stress.ycql_perf_test;"
+
+# 2. Доступен ли порт 9042?
+docker exec -it yugabyte_yb-tserver1_1 netstat -tlnp | grep 9042
+
+# 3. Работает ли TServer?
+docker exec -it yugabyte_yb-tserver1_1 ps aux | grep yb-tserver
+```
+
+## 📊 Ожидаемая производительность
+
+| Метод | Скорость | Простота | Рекомендация |
+|-------|----------|----------|--------------|
+| **Python + прямой INSERT** | 100-500 строк/сек | Средняя | Для тестов, прост в отладке |
+| **ycqlsh COPY** | 1000-5000 строк/сек | Высокая | Для загрузки готовых CSV |
+| **Cassandra Loader** | 10000+ строк/сек | Низкая | Для production загрузки |
+
+**Совет:** Начните с метода Python (Вариант 2 для генерации + Метод B для вставки). Это займет 2-3 минуты на 100K строк и покажет реальную производительность YCQL.
+
+Какой объем данных вы планируете вставить для окончательного теста?
+
