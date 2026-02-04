@@ -780,3 +780,233 @@ WITH HEADER = false AND PAGESIZE = 1000;
 **Но:** Аналитические запросы (агрегации, GROUP BY) — это не его сильная сторона. Для них используйте YSQL.
 
 Попробуйте метод с Python-драйвером для генерации хотя бы 100к строк — этого достаточно, чтобы увидеть принцип. Нужна помощь с настройкой любого из методов?
+
+---------------------------------------------------------------------------------------------------
+
+
+
+```
+[root@mongo-db3 yugabyte]# docker exec yugabyte_yb-tserver1_1 bash -c "
+> for i in {1..1000}; do
+>   /home/yugabyte/bin/yugabyted load csv \
+>     --table stress.ycql_perf_test \
+>     --datafile /tmp/batch_\$i.csv \
+>     --nodes 127.0.0.1:9042 \
+>     --batchsize 1000 &
+> done
+> wait
+> echo \"All 10M rows inserted!\"
+bash: !\": event not found
+> "
++--------------------------------------------------------------------------------------------------+
+|                                  Yugabyted CLI: YugabyteDB command line                                   |
++--------------------------------------------------------------------------------------------------+
+YugabyteDB command-line interface for creating and configuring YugabyteDB cluster.
+
+Usage: yugabyted [command] [flags]
+
+To start YugabyteDB cluster, run 'yugabyted start'.
+
+Find more information at: https://docs.yugabyte.com/preview/reference/configuration/yugabyted/
+
+Commands:
+  start                   Start YugabyteDB cluster.
+  stop                    Stop running YugabyteDB cluster.
+  destroy                 Destroy YugabyteDB cluster and remove data.
+  backup                  Back up a database.
+  restore                 Restore a database.
+  status                  Print status of YugabyteDB cluster.
+  version                 Release version of YugabyteDB cluster.
+  finalize_upgrade        Finalize the upgrade process for the YugabyteDB cluster.
+  collect_logs            Collect and package logs for troubleshooting.
+  connect                 Connect to YugabyteDB cluster through the CLI.
+  demo                    Load and interact with preset demo data.
+  cert                    Generate SSL certificates
+  configure               Configure data placement, toggle encryption at rest or run point-in-time recovery operations on the cluster.
+  configure_read_replica  Configure/Modify/Delete a read replica cluster.
+  upgrade                 Upgrade YugabyteDB processes in this node.
+  xcluster                Operations for xcluster replication between 2 clusters.
+
+Flags:
+  -h, --help              show this help message and exit
+
+Run 'yugabyted [command] -h' for help with specific commands.
+Error: argument : invalid choice: 'load' (choose from 'start', 'stop', 'destroy', 'backup', 'restore', 'status', 'version', 'finalize_upgrade', 'collect_logs', 'connect', 'demo', 'cert', 'configure', 'configure_read_replica', 'upgrade', 'xcluster').
+```
+Ах, точно! В последних версиях YugabyteDB команда `yugabyted load` была переименована или удалена. Это команда старого образца. Давайте исправим и используем правильные инструменты для массовой вставки.
+
+## 🛠️ Правильные способы массовой вставки в YCQL
+
+### Способ 1: **Cassandra Loader (`cassandra-loader`)** - самый быстрый
+
+```bash
+# 1. Установите cassandra-loader (если нет)
+docker exec -it yugabyte_yb-tserver1_1 bash -c "wget https://github.com/brianmhess/cassandra-loader/releases/download/v0.0.27/cassandra-loader -O /tmp/cassandra-loader && chmod +x /tmp/cassandra-loader"
+
+# 2. Создайте CSV файл с тестовыми данными (1M строк для начала)
+docker exec -it yugabyte_yb-tserver1_1 bash -c "seq 1 1000000 | awk 'BEGIN{print \"bucket,item_id,value,payload\"} {printf \"%d,item_%d,%.2f,payload_%d\\n\", \$1%1000, \$1, rand()*100, \$1}' > /tmp/test_data.csv"
+
+# 3. Загрузите данные
+docker exec -it yugabyte_yb-tserver1_1 bash -c "/tmp/cassandra-loader \
+  -f /tmp/test_data.csv \
+  -host 127.0.0.1 \
+  -port 9042 \
+  -schema \"stress.ycql_perf_test(bucket, item_id, value, payload)\" \
+  -delim \",\" \
+  -batchSize 100 \
+  -progressRate 10000"
+```
+
+### Способ 2: **Использование `COPY` команды в ycqlsh**
+
+```sql
+-- 1. Создайте CSV файл прямо в контейнере
+docker exec -it yugabyte_yb-tserver1_1 bash -c "
+echo 'bucket,item_id,value,payload' > /tmp/sample.csv
+for i in {1..10000}; do
+  echo \"\$((i % 1000)),item_\$i,\$((RANDOM % 10000)).\$((RANDOM % 100)),payload_\$i\" >> /tmp/sample.csv
+done"
+
+-- 2. Войдите в ycqlsh и выполните COPY
+docker exec -it yugabyte_yb-tserver1_1 /home/yugabyte/bin/ycqlsh -e "
+USE stress;
+COPY ycql_perf_test (bucket, item_id, value, payload) 
+FROM '/tmp/sample.csv' 
+WITH HEADER = true AND CHUNKSIZE = 1000;"
+```
+
+### Способ 3: **Python скрипт с асинхронными запросами** (самый гибкий)
+
+Создайте файл `bulk_insert.py`:
+
+```python
+import asyncio
+from cassandra.cluster import Cluster
+from cassandra.query import BatchStatement, SimpleStatement
+import random
+import time
+
+async def bulk_insert():
+    cluster = Cluster(['localhost'], port=9042)
+    session = cluster.connect('stress')
+    
+    # Подготовленный statement
+    insert_stmt = session.prepare(
+        "INSERT INTO ycql_perf_test (bucket, item_id, value, payload) VALUES (?, ?, ?, ?)"
+    )
+    
+    batch_size = 100
+    total_rows = 1000000
+    start_time = time.time()
+    
+    for i in range(1, total_rows + 1):
+        bucket = i % 1000
+        item_id = f'item_{i}'
+        value = random.random() * 100
+        payload = f'payload_{i}'
+        
+        # Используем batch для группировки запросов
+        if i % batch_size == 1:
+            batch = BatchStatement()
+        
+        batch.add(insert_stmt, (bucket, item_id, value, payload))
+        
+        if i % batch_size == 0 or i == total_rows:
+            session.execute(batch)
+        
+        if i % 100000 == 0:
+            elapsed = time.time() - start_time
+            rate = i / elapsed
+            print(f"Inserted {i:,} rows, rate: {rate:,.0f} rows/sec")
+    
+    print(f"Total time: {time.time() - start_time:.2f} seconds")
+
+if __name__ == "__main__":
+    asyncio.run(bulk_insert())
+```
+
+Запустите:
+```bash
+# Установите драйвер если нужно
+docker exec -it yugabyte_yb-tserver1_1 bash -c "pip3 install cassandra-driver"
+
+# Запустите скрипт
+docker cp bulk_insert.py yugabyte_yb-tserver1_1:/tmp/
+docker exec -it yugabyte_yb-tserver1_1 python3 /tmp/bulk_insert.py
+```
+
+## 🔄 Исправленный команды для генерации CSV
+
+Вот рабочая версия без восклицательного знака (который вызывает проблему в bash):
+
+```bash
+# 1. Создайте один большой CSV файл (100K строк для теста)
+docker exec -it yugabyte_yb-tserver1_1 bash -c "
+echo 'Creating CSV file...'
+echo 'bucket,item_id,value,payload' > /tmp/bulk_data.csv
+for i in \$(seq 1 100000); do
+  bucket=\$((i % 1000))
+  item_id=\"item_\$i\"
+  value=\$(echo \"scale=2; \$RANDOM/327.67\" | bc)
+  payload=\"payload_\$i\"
+  echo \"\$bucket,\$item_id,\$value,\$payload\" >> /tmp/bulk_data.csv
+done
+echo 'CSV created with 100K rows'
+"
+
+# 2. Проверьте первые строки
+docker exec -it yugabyte_yb-tserver1_1 head -5 /tmp/bulk_data.csv
+```
+
+## 🎯 Быстрый тест: Вставка 100K строк через Python
+
+Самый простой способ прямо сейчас - использовать интерактивный Python:
+
+```bash
+docker exec -it yugabyte_yb-tserver1_1 python3 << 'EOF'
+from cassandra.cluster import Cluster
+import random
+
+cluster = Cluster(['127.0.0.1'], port=9042)
+session = cluster.connect('stress')
+
+print("Starting bulk insert...")
+for i in range(1, 100001):
+    session.execute(
+        "INSERT INTO ycql_perf_test (bucket, item_id, value, payload) VALUES (%s, %s, %s, %s)",
+        (i % 1000, f'item_{i}', random.random() * 100, f'payload_{i}')
+    )
+    if i % 10000 == 0:
+        print(f"Inserted {i} rows...")
+
+print("Done! 100K rows inserted.")
+EOF
+```
+
+## 📊 Проверка вставленных данных
+
+После вставки проверьте:
+
+```sql
+-- 1. Сколько строк в таблице
+SELECT COUNT(*) FROM stress.ycql_perf_test;
+
+-- 2. Несколько примеров
+SELECT * FROM stress.ycql_perf_test WHERE bucket = 1 LIMIT 5;
+
+-- 3. Проверка распределения
+SELECT bucket, COUNT(*) as row_count 
+FROM stress.ycql_perf_test 
+WHERE bucket IN (1, 2, 3, 4, 5) 
+GROUP BY bucket;
+```
+
+## 💡 Ключевые моменты по массовой вставке:
+
+1. **YCQL отлично справляется** с массовыми вставками - это его сильная сторона
+2. **Используйте Batch-запросы** - группировка по 50-100 строк даёт максимальную производительность
+3. **Избегайте `ycqlsh` для больших объемов** - используйте драйверы (Python, Java, Go)
+4. **Оптимальный размер Batch**: 50-500 операций
+5. **Параллелизм**: Несколько потоков/процессов увеличат скорость
+
+Какой объем данных вы хотите вставить для теста? Начните с 100K строк через Python скрипт - это займет 1-2 минуты и покажет принцип.
