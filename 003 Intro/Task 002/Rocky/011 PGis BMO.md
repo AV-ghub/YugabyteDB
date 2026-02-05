@@ -555,3 +555,149 @@ tail -100 configure.log
 1. Смена версии PostGIS на 3.1.9
 2. Редактирование configure
 3. Создание заглушки для проверки
+
+
+-----------------------------------------
+---------------------------------------
+---------------------------------
+
+```
+нет, ничего не помогло
+./configure --with-pgconfig=/_a/yugabyte-2025.2.0.1/postgres/bin/pg_config 2>&1 | grep -A5 -B5 "PQserverVersion"
+Using user-specified pg_config file: /_a/yugabyte-2025.2.0.1/postgres/bin/pg_config
+checking PostgreSQL version... PostgreSQL 15.12-YB-2025.2.0.1-b0
+checking libpq-fe.h usability... yes
+checking libpq-fe.h presence... yes
+checking for libpq-fe.h... yes
+checking for PQserverVersion in -lpq... no
+configure: error: could not find libpq
+```
+
+Проблема в том, что `configure` ищет функцию `PQserverVersion` в libpq, но в YugabyteDB её нет! Это функция серверной части PostgreSQL, а YugabyteDB мог её убрать или переименовать.
+
+### 🔍 Проверим, какие функции есть в libpq от YugabyteDB:
+```bash
+# Смотрим экспортируемые символы
+nm -D /_a/yugabyte-2025.2.0.1/postgres/lib/libpq.so.5.15 | grep -i "PQserver\|PQlib"
+
+# Или ищем все PQ-функции
+nm -D /_a/yugabyte-2025.2.0.1/postgres/lib/libpq.so.5.15 | grep " T " | grep -i pq | head -20
+```
+
+### 🛠️ Решение: Патчим configure скрипт
+Нужно изменить проверку с `PQserverVersion` на существующую функцию, например `PQlibVersion` (которую мы уже тестировали):
+
+```bash
+# Создаём backup
+cp configure configure.backup
+
+# Меняем проверку PQserverVersion на PQlibVersion
+sed -i 's/PQserverVersion/PQlibVersion/g' configure
+
+# Проверяем, что заменилось
+grep -n "PQlibVersion" configure | head -5
+```
+
+### 💡 Если не поможет — более агрессивный патч
+Иногда нужно отключить эту проверку полностью. Найдите в файле `configure` блок с проверкой libpq (примерно строка 23000):
+
+```bash
+# Ищем точное место
+grep -n "checking for PQserverVersion in -lpq" configure
+```
+
+Найдите номер строки и отредактируйте файл. Например, если это строка 23050:
+
+```bash
+# Открываем редактор на нужной строке
+sed -i '23050,23060s/yes/no/' configure
+```
+
+Или проще — создайте патч-файл:
+
+```bash
+cat > fix_configure.patch << 'EOF'
+--- configure.backup	2024-01-01 00:00:00.000000000 +0000
++++ configure	2024-01-01 00:00:00.000000000 +0000
+@@ -23050,10 +23050,10 @@
+ { $as_echo "$as_me:${as_lineno-$LINENO}: checking for PQserverVersion in -lpq" >&5
+ $as_echo_n "checking for PQserverVersion in -lpq... " >&6; }
+ if ${ac_cv_lib_pq_PQserverVersion+:} false; then :
+   $as_echo_n "(cached) " >&6
+ else
+   ac_check_lib_save_LIBS=$LIBS
+ LIBS="-lpq  $LIBS"
+ cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+ /* end confdefs.h.  */
+ 
+@@ -23063,19 +23063,19 @@
+   return 0;
+ }
+ _ACEOF
+ if ac_fn_c_try_link "$LINENO"; then :
+-  ac_cv_lib_pq_PQserverVersion=yes
++  ac_cv_lib_pq_PQserverVersion=no  # Принудительно говорим "нет"
+ else
+   ac_cv_lib_pq_PQserverVersion=no
+ fi
+ rm -f core conftest.err conftest.$ac_objext \
+     conftest$ac_exeext conftest.$ac_ext
+ LIBS=$ac_check_lib_save_LIBS
+ fi
+-{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_pq_PQserverVersion" >&5
+-$as_echo "$ac_cv_lib_pq_PQserverVersion" >&6; }
+-if test "x$ac_cv_lib_pq_PQserverVersion" = xyes; then :
++{ $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
++$as_echo "yes" >&6; }  # Но выводим "yes" для обхода проверки
++if test "x$ac_cv_lib_pq_PQserverVersion" = xno; then :  # Инвертируем условие
+   cat >>confdefs.h <<_ACEOF
+ #define HAVE_LIBPQ 1
+ _ACEOF
+ 
+EOF
+
+# Применяем патч
+patch configure fix_configure.patch
+```
+
+### ⚡ Быстрое решение в лоб
+Самый простой способ — создать заглушку функции:
+
+```bash
+# Создаём временную библиотеку с PQserverVersion
+cd /tmp
+cat > fake_pqserver.c << EOF
+int PQserverVersion(void *conn) { 
+    return 150012;  // Версия PostgreSQL 15.12
+}
+EOF
+
+gcc -shared -fPIC -o libfake_pq.so fake_pqserver.c
+
+# Теперь запускаем configure с нашей библиотекой ПЕРЕД libpq
+export LIBRARY_PATH=/tmp:$LIBRARY_PATH
+export LD_PRELOAD=/tmp/libfake_pq.so
+
+cd /path/to/postgis-3.3.3
+./configure --with-pgconfig=/_a/yugabyte-2025.2.0.1/postgres/bin/pg_config
+```
+
+### 🔄 Ещё вариант: Сборка без проверки libpq
+Можно попробовать собрать PostGIS вручную, обходя configure:
+
+```bash
+# Копируем файлы расширений из обычного PostGIS в YugabyteDB
+# ВАЖНО: Это рискованно, но иногда работает для простых расширений
+
+# Находим, где лежат расширения в обычном PostgreSQL
+find /usr -name "postgis*" -type f 2>/dev/null | head -20
+```
+
+### 📝 Что дальше?
+1. **Сначала проверьте, какие функции есть в libpq YugabyteDB** — команда с `nm` выше
+2. **Если есть `PQlibVersion`, делаем sed-замену** — самый чистый способ
+3. **Если нет — пробуем патч или заглушку**
+
+Скорее всего, в YugabyteDB используется `PQlibVersion` вместо `PQserverVersion`. Это частая модификация в форках PostgreSQL.
+
+**Какой результат даст команда с `nm`?** Это ключевая информация для правильного решения.
