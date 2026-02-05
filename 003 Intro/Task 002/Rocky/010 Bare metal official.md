@@ -15,7 +15,7 @@ tar xvfz yugabyte-2025.2.0.1-b1-linux-x86_64.tar.gz && cd yugabyte-2025.2.0.1/
 | YSQL Status         : Ready                                                                               |
 | Replication Factor  : 1                                                                                   |
 | YugabyteDB UI       : http://xx.xx.xx.xx:15433                                                           |
-| JDBC                : jdbc:postgresql://10.19.57.138:5433/yugabyte?user=yugabyte&password=yugabyte        |
+| JDBC                : jdbc:postgresql://xx.xx.xx.xx:5433/yugabyte?user=yugabyte&password=yugabyte        |
 | YSQL                : bin/ysqlsh -h xx.xx.xx.xx  -U yugabyte -d yugabyte                                 |
 | YCQL                : bin/ycqlsh xx.xx.xx.xx 9042 -u cassandra                                           |
 | Data Dir            : /root/var/data                                                                      |
