@@ -1122,3 +1122,75 @@ docker run --rm postgis/postgis:15-3.5 bash -c 'ls -la /usr/lib/x86_64-linux-gnu
 **Начните со Способа 2**. Это быстрый тест, который подтвердит, что проблема именно в этой конкретной библиотеке и её симлинках. Если он сработает, вы сможете сразу протестировать PostGIS. Затем для создания постоянного решения **используйте исправленный Dockerfile из Способа 1**, чтобы образ был готов к любому развертыванию.
 
 Попробуйте Способ 2 и сообщите результат. Если снова будет ошибка о другой библиотеке — мы добавим её в список для копирования.
+
+
+---------------------------------------------
+----------------------------------------
+--------------------------------
+
+```
+вот такое теперь
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos_c.so.1 /tmp/libgeos_c.so.1
+Successfully copied 1.54kB to /tmp/libgeos_c.so.1
+
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos_c.so.1.17.2 /tmp/libgeos_c.so.1.17.2
+Error response from daemon: Could not find the file /usr/lib/x86_64-linux-gnu/libgeos_c.so.1.17.2 in container temp_postgis
+```
+Отлично, мы нашли причину: **версия библиотеки GEOS в образе `postgis/postgis:15-3.5` отличается** от той, что мы предполагали. Вместо `1.17.2` там другая версия. Нужно сначала узнать точное имя файла.
+
+### 🔍 Шаг 1: Узнаём точные имена библиотек в образе PostGIS
+```bash
+# Узнаем, какие файлы libgeos_c есть в образе
+docker run --rm postgis/postgis:15-3.5 bash -c 'ls -la /usr/lib/x86_64-linux-gnu/libgeos_c.so*'
+
+# А также какие файлы libgeos-3*
+docker run --rm postgis/postgis:15-3.5 bash -c 'ls -la /usr/lib/x86_64-linux-gnu/libgeos-*.so*'
+```
+
+### 🛠️ Шаг 2: Копируем правильные версии (используйте реальные имена из вывода выше)
+Предположим, вывод показывает `libgeos_c.so.1 -> libgeos_c.so.1.18.0` и `libgeos-3.10.0.so.1 -> libgeos-3.10.0.so.1.18.0`. Тогда команды будут:
+
+```bash
+# Копируем ОБА файла: симлинк и реальную библиотеку
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos_c.so.1.18.0 /tmp/
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos-3.10.0.so.1.18.0 /tmp/
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos-3.10.0.so.1 /tmp/
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos-3.10.0.so /tmp/
+
+# Копируем в контейнер yugabyte-pg
+docker cp /tmp/libgeos_c.so.1.18.0 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+docker cp /tmp/libgeos-3.10.0.so.1.18.0 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+docker cp /tmp/libgeos-3.10.0.so.1 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+docker cp /tmp/libgeos-3.10.0.so yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+
+# Создаем недостающий симлинк libgeos_c.so.1 -> libgeos_c.so.1.18.0 внутри контейнера
+docker exec yugabyte-pg bash -c "cd /home/yugabyte/lib/yb-thirdparty/ && ln -sf libgeos_c.so.1.18.0 libgeos_c.so.1"
+
+# Обновляем кэш библиотек
+docker exec yugabyte-pg ldconfig /home/yugabyte/lib/yb-thirdparty/
+```
+
+### 🚀 Шаг 3: Проверяем работу PostGIS
+```bash
+docker exec -it yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+```
+
+### 📝 Шаг 4: Обновляем Dockerfile для постоянного решения
+После того как определили правильные версии, обновите `Dockerfile`. Замените блок копирования GEOS на что-то вроде:
+
+```dockerfile
+# Копируем GEOS с правильными версиями
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos_c.so.1.18.0 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos_c.so.1 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos-3.10.0.so.1.18.0 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos-3.10.0.so.1 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos-3.10.0.so /home/yugabyte/postgres/../lib/yb-thirdparty/
+```
+
+### 💡 Важно
+Если после добавления GEOS появится ошибка про другую библиотеку (например, `libgdal`), повторяем тот же процесс:
+1. Узнаём точное имя через `ls -la /usr/lib/x86_64-linux-gnu/libgdal.so*`
+2. Копируем обе версии (симлинк и реальный файл)
+3. Добавляем в Dockerfile
+
+**Первый шаг — выполните команды `ls` из Шага 1 и покажите вывод.** Это даст нам точные имена файлов для работы.
