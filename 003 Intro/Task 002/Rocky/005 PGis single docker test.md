@@ -719,3 +719,108 @@ COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos_c.so.1 /home/yugaby
 После этого могут всплыть ошибки о других библиотеках (`libgdal`, `libproj` и т.д.). Для каждой из них **применяйте ту же логику** — копируйте через `tar` или явно все файлы цепочки.
 
 **Вы на последнем этапе!** После решения с GEOS PostGIS должен запуститься. Если появится новая ошибка — пишите, будем добавлять зависимости.
+
+----------------------------------
+------------------------------
+-----------------------------
+```
+еще проблема
+docker build -f Dockerfile.postgis.final -t yugabyte-with-postgis-final:2025.2 .
+[+] Building 0.4s (10/16)                                                                                                                                                                      docker:default
+ => [internal] load build definition from Dockerfile.postgis.final                                                                                                                                       0.0s
+ => => transferring dockerfile: 2.65kB                                                                                                                                                                   0.0s
+ => [internal] load metadata for docker.io/postgis/postgis:15-3.5                                                                                                                                        0.0s
+ => [internal] load metadata for docker.io/yugabytedb/yugabyte:2025.2.0.1-b1                                                                                                                             0.0s
+ => [internal] load .dockerignore                                                                                                                                                                        0.0s
+ => => transferring context: 2B                                                                                                                                                                          0.0s
+ => [stage-1  1/11] FROM docker.io/yugabytedb/yugabyte:2025.2.0.1-b1                                                                                                                                     0.0s
+ => CACHED [postgis_source 1/1] FROM docker.io/postgis/postgis:15-3.5                                                                                                                                    0.0s
+ => CACHED [stage-1  2/11] COPY --from=postgis_source /usr/lib/postgresql/15/lib/postgis*.so /home/yugabyte/postgres/lib/                                                                                0.0s
+ => CACHED [stage-1  3/11] COPY --from=postgis_source /usr/share/postgresql/15/extension/postgis* /home/yugabyte/postgres/share/extension/                                                               0.0s
+ => CANCELED [stage-1  4/11] RUN cd /usr/lib/x86_64-linux-gnu &&     tar -chzf /tmp/geos-libs.tar.gz libgeos*.so*                                                                                        0.3s
+ => ERROR [stage-1  5/11] COPY --from=postgis_source /tmp/geos-libs.tar.gz /tmp/                                                                                                                         0.0s
+------
+ > [stage-1  5/11] COPY --from=postgis_source /tmp/geos-libs.tar.gz /tmp/:
+------
+Dockerfile.postgis.final:19
+--------------------
+  17 |
+  18 |     # 2. Копируем архив и распаковываем его в целевом образе
+  19 | >>> COPY --from=postgis_source /tmp/geos-libs.tar.gz /tmp/
+  20 |     RUN tar -xzf /tmp/geos-libs.tar.gz -C /home/yugabyte/postgres/../lib/yb-thirdparty/ && \
+  21 |         rm -f /tmp/geos-libs.tar.gz
+--------------------
+ERROR: failed to build: failed to solve: failed to compute cache key: failed to calculate checksum of ref 4e4a27df-df7a-45ac-ae9f-13c145dcbff4::qbtumwsszlhq2lofqavask9h8: "/tmp/geos-libs.tar.gz": not found
+[]#
+```
+
+Проблема в том, что команда `RUN cd /usr/lib/x86_64-linux-gnu && tar -chzf /tmp/geos-libs.tar.gz libgeos*.so*` выполняется **в контексте второго образа (stage-1)**, а не в `postgis_source`. Поэтому архива там нет.
+
+Нужно создавать архив **внутри первого этапа (postgis_source)**, а затем копировать его.
+
+Вот исправленный и более простой `Dockerfile`:
+
+```dockerfile
+# Этап 1: Берем официальный образ PostGIS для PostgreSQL 15
+FROM postgis/postgis:15-3.5 AS postgis_source
+
+# 1. В ЭТОМ ЭТАПЕ создаем архив с библиотеками GEOS
+RUN cd /usr/lib/x86_64-linux-gnu && \
+    tar -chzf /tmp/geos-libs.tar.gz libgeos*.so* libgdal*.so* libproj*.so* libjson-c*.so* libprotobuf-c*.so*
+
+# Этап 2: Берем работающий образ YugabyteDB
+FROM yugabytedb/yugabyte:2025.2.0.1-b1
+
+# Копируем файлы PostGIS из первого контейнера
+COPY --from=postgis_source /usr/lib/postgresql/15/lib/postgis*.so /home/yugabyte/postgres/lib/
+COPY --from=postgis_source /usr/share/postgresql/15/extension/postgis* /home/yugabyte/postgres/share/extension/
+
+# 2. Копируем архив ВСЕХ зависимостей из первого этапа
+COPY --from=postgis_source /tmp/geos-libs.tar.gz /tmp/
+
+# 3. Распаковываем архив в каталог YugabyteDB для сторонних библиотек
+RUN tar -xzf /tmp/geos-libs.tar.gz -C /home/yugabyte/postgres/../lib/yb-thirdparty/ && \
+    rm -f /tmp/geos-libs.tar.gz
+
+# Обязательно перелинковываем библиотеки в образе YugabyteDB
+RUN /home/yugabyte/bin/post_install.sh -e
+```
+
+**Ключевые изменения:**
+1. **`RUN tar ...` перемещен в этап `postgis_source`** (строка 6) — архив создаётся там, где есть библиотеки.
+2. **Архив теперь включает все основные зависимости** (`libgeos*.so* libgdal*.so* ...`) — это упреждающее решение, чтобы избежать следующих ошибок.
+3. **Копируется один архив** со всеми библиотеками (строка 19), что проще и надежнее.
+
+### 🚀 Сборка и тест
+1.  **Пересоберите образ**:
+    ```bash
+    docker build -f Dockerfile.postgis.final -t yugabyte-with-postgis-final:2025.2 .
+    ```
+
+2.  **Перезапустите контейнер**:
+    ```bash
+    docker stop yugabyte-pg 2>/dev/null; docker rm yugabyte-pg 2>/dev/null
+    docker run -d \
+      --name yugabyte-pg \
+      -p 5435:5433 \
+      -p 9045:9042 \
+      -p 7005:7000 \
+      yugabyte-with-postgis-final:2025.2 \
+      /home/yugabyte/bin/yugabyted start --background=false
+    ```
+
+3.  **Проверьте PostGIS** (подождите 90 секунд):
+    ```bash
+    sleep 90
+    docker exec yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+    ```
+
+### 💡 Если сборка пройдёт, но будет ошибка о другой библиотеке
+Если появится ошибка, например, `libsomething.so.X not found`, просто **добавьте этот шаблон в команду `tar` на этапе `postgis_source`**:
+```dockerfile
+RUN cd /usr/lib/x86_64-linux-gnu && \
+    tar -chzf /tmp/geos-libs.tar.gz libgeos*.so* libgdal*.so* libproj*.so* libjson-c*.so* libprotobuf-c*.so* libicu*.so*
+```
+... и пересоберите образ.
+
+**Попробуйте этот исправленный Dockerfile.** Он должен решить проблему с GEOS и, возможно, сразу все остальные зависимости.
