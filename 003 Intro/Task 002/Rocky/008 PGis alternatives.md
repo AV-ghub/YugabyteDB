@@ -318,3 +318,16 @@ curl -s https://registry.hub.docker.com/v2/repositories/yugabytedb/yugabyte/tags
 Если найдётся подходящий тег (например, `2025.2.0.1-b1-debian`), просто **замените вторую строку `FROM`** в любом из наших Dockerfile на этот тег — и проблема GLIBC решится сама собой.
 
 **Попробуйте исправленный Dockerfile.** Если сборка пройдёт успешно, PostGIS должен заработать. Если будут ошибки на этапе установки PostGIS — сообщите, будем корректировать команды `yum`.
+
+
+-----------------
+-------------
+--------------------
+
+```
+нет, все то же
+
+ => ERROR [postgis-on-centos7 3/9] RUN yum install -y wget &&     wget https://download.postgresql.org/pub/repos/yum/reporpms/EL-7-x86_64/pgdg-redhat-repo-latest.noarch.rpm &&     rpm -ivh pgdg-redha  1.2s
+------
+```
+
