@@ -516,3 +516,114 @@ docker exec yugabyte-pg /home/yugabyte/bin/ysqlsh -h localhost -p 5433 -U yugaby
 ```
 
 **Попробуйте диагностику внутри контейнера (шаги 1-5) и сообщите, что получилось.**
+
+
+----------------------------------------
+--------------------------------------
+-------------------------
+
+```
+вот так
+[]# docker exec -it yugabyte-pg bash
+[]#
+[]# hostname -I
+172.16.0.2
+[]#
+[]# netstat -tlnp | grep 5433
+tcp        0      0 172.16.0.2:5433         0.0.0.0:*               LISTEN      298/postgres
+tcp        0      0 172.16.0.2:15433        0.0.0.0:*               LISTEN      278/yugabyted-ui
+[]#
+[]# /home/yugabyte/bin/ysqlsh -h 127.0.0.1 -p 5433 -U yugabyte -c "SELECT version();"
+ysqlsh: error: connection to server at "127.0.0.1", port 5433 failed: Connection refused
+        Is the server running on that host and accepting TCP/IP connections?
+[]#
+[]# /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte -c "SELECT version();"
+                                                                                          version
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 15.12-YB-2025.2.0.1-b0 on x86_64-pc-linux-gnu, compiled by clang version 19.1.0 (https://github.com/yugabyte/llvm-project.git a2a6b655e14e7fa1fcf1011a6cb29cb8575249c0), 64-bit
+(1 row)
+
+[]#
+[]# /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+ERROR:  could not load library "/home/yugabyte/postgres/lib/postgis-3.so": libgeos_c.so.1: cannot open shared object file: No such file or directory
+
+прогресс вроде бы есть
+давай попробуем довести до полной работоспособности?
+```
+
+Отлично! **Прогресс огромный**. Мы выяснили:
+1.  Контейнер слушает на `172.16.0.2:5433`.
+2.  Базовое подключение работает.
+3.  **PostGIS подключился!** Ошибка `libgeos_c.so.1` — это **стандартная проблема отсутствия зависимостей**, которую мы как раз ожидали и знаем, как решить.
+
+### 🛠️ Решение: Копирование недостающих библиотек
+Библиотека `libgeos_c.so.1` — ключевая зависимость PostGIS. Её нужно скопировать из образа `postgis/postgis` в наш финальный образ, а затем выполнить перелинковку.
+
+Обновите ваш `Dockerfile.postgis.final`, добавив копирование зависимостей **перед** инструкцией `RUN post_install.sh -e`:
+
+```dockerfile
+# Этап 1: Берем официальный образ PostGIS для PostgreSQL 15
+FROM postgis/postgis:15-3.5 AS postgis_source
+
+# Этап 2: Берем работающий образ YugabyteDB
+FROM yugabytedb/yugabyte:2025.2.0.1-b1
+
+# Копируем файлы PostGIS из первого контейнера
+COPY --from=postgis_source /usr/lib/postgresql/15/lib/postgis*.so /home/yugabyte/postgres/lib/
+COPY --from=postgis_source /usr/share/postgresql/15/extension/postgis* /home/yugabyte/postgres/share/extension/
+
+# Ключевое дополнение: копируем системные зависимости PostGIS
+# Копируем GEOS (самая важная библиотека для гео-операций)
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos_c.so.1 /home/yugabyte/postgres/../lib/yb-thirdparty/
+# Копируем другие частые зависимости PostGIS для страховки
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgdal.so.* /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libproj.so.* /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libjson-c.so.* /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libprotobuf-c.so.* /home/yugabyte/postgres/../lib/yb-thirdparty/
+
+# Обязательно перелинковываем библиотеки в образе YugabyteDB
+RUN /home/yugabyte/bin/post_install.sh -e
+```
+
+**Что делает этот блок:**
+*   Мы копируем необходимые `.so` файлы из образа, где PostGIS уже собран и работает (`postgis_source`).
+*   Мы помещаем их в каталог, где YugabyteDB ищет сторонние библиотеки (`/home/yugabyte/postgres/../lib/yb-thirdparty/`, что эквивалентно `/home/yugabyte/lib/yb-thirdparty/`).
+*   Команда `post_install.sh -e` обновляет системные кэши библиотек внутри контейнера.
+
+### 🚀 Пересборка и тестирование
+
+1.  **Пересоберите образ**:
+    ```bash
+    docker build -f Dockerfile.postgis.final -t yugabyte-with-postgis-final:2025.2 .
+    ```
+
+2.  **Перезапустите контейнер** (старый нужно удалить, так как volumes могут мешать):
+    ```bash
+    docker stop yugabyte-pg && docker rm yugabyte-pg
+    docker run -d \
+      --name yugabyte-pg \
+      -p 5435:5433 \
+      -p 9045:9042 \
+      -p 7005:7000 \
+      yugabyte-with-postgis-final:2025.2 \
+      /home/yugabyte/bin/yugabyted start --background=false
+    ```
+
+3.  **Подождите 90 секунд** и выполните тест:
+    ```bash
+    sleep 90
+    docker exec yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+    ```
+
+### 🔍 Если появится новая ошибка о другой библиотеке
+Процесс может быть итеративным. Если после добавления GEOS появится ошибка о другой библиотеке (например, `libgdal.so.32`), просто **добавьте ещё одну строку `COPY`** для неё в `Dockerfile` и пересоберите образ.
+
+Чтобы найти полный путь к недостающей библиотеке прямо в образе-источнике, можно выполнить:
+```bash
+docker run --rm postgis/postgis:15-3.5 find /usr -name "libgdal.so.*" 2>/dev/null
+```
+
+### 💎 Итог и следующий шаг
+Вы на финишной прямой. Ошибка `libgeos_c.so.1` — это **нормальный и последний значительный этап** настройки. После добавления зависимостей в Dockerfile и пересборки PostGIS должен заработать полностью.
+
+**Попробуйте обновить Dockerfile и пересобрать образ.** Если появится новая, конкретная ошибка — напишите её, и мы тут же дополним решение.
