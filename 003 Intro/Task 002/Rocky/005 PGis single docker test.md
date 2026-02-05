@@ -1194,3 +1194,87 @@ COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos-3.10.0.so /home/yug
 3. Добавляем в Dockerfile
 
 **Первый шаг — выполните команды `ls` из Шага 1 и покажите вывод.** Это даст нам точные имена файлов для работы.
+
+
+------------------------------------
+-------------------------------
+-------------------------------
+
+```
+вот так вот
+[]# docker run --rm postgis/postgis:15-3.5 bash -c 'ls -la /usr/lib/x86_64-linux-gnu/libgeos_c.so*'
+lrwxrwxrwx 1 root root     19 Dec 10  2020 /usr/lib/x86_64-linux-gnu/libgeos_c.so.1 -> libgeos_c.so.1.16.2
+-rw-r--r-- 1 root root 239640 Dec 10  2020 /usr/lib/x86_64-linux-gnu/libgeos_c.so.1.16.2
+[]#
+[]#
+[]#
+[]# docker run --rm postgis/postgis:15-3.5 bash -c 'ls -la /usr/lib/x86_64-linux-gnu/libgeos-*.so*'
+-rw-r--r-- 1 root root 2156768 Dec 10  2020 /usr/lib/x86_64-linux-gnu/libgeos-3.9.0.so
+```
+
+Отлично! Мы нашли точные версии. В образе `postgis/postgis:15-3.5` установлены:
+*   `libgeos_c.so.1 -> libgeos_c.so.1.16.2`
+*   `libgeos-3.9.0.so` (без дополнительных симлинков `.so.1`)
+
+Теперь мы можем скопировать **именно эти файлы** и создать недостающий симлинк.
+
+### 🛠️ Шаг 1: Копируем правильные версии в работающий контейнер
+
+```bash
+# Удаляем старый временный контейнер и создаем новый
+docker rm temp_postgis 2>/dev/null || true
+docker create --name temp_postgis postgis/postgis:15-3.5
+
+# Копируем ВСЕ нужные файлы GEOS из образа PostGIS во временную директорию
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos_c.so.1.16.2 /tmp/
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos_c.so.1 /tmp/
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos-3.9.0.so /tmp/
+
+# Копируем их в контейнер yugabyte-pg в каталог сторонних библиотек
+docker cp /tmp/libgeos_c.so.1.16.2 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+docker cp /tmp/libgeos_c.so.1 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+docker cp /tmp/libgeos-3.9.0.so yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+
+# Внутри контейнера создаём недостающий симлинк libgeos-3.9.0.so -> libgeos-3.9.0.so.1
+# (PostGIS ищет именно libgeos-3.9.0.so, а для корректной работы цепочки зависимостей нужен .so.1)
+docker exec yugabyte-pg bash -c "cd /home/yugabyte/lib/yb-thirdparty/ && ln -sf libgeos-3.9.0.so libgeos-3.9.0.so.1"
+
+# Обязательно обновляем кэш динамических библиотек
+docker exec yugabyte-pg ldconfig /home/yugabyte/lib/yb-thirdparty/
+
+# Удаляем временный контейнер
+docker rm temp_postgis
+```
+
+### 🚀 Шаг 2: Проверяем работу PostGIS
+
+```bash
+docker exec -it yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+```
+
+### 📝 Шаг 3: Обновляем Dockerfile для постоянного решения
+
+После успешного теста обновите `Dockerfile`, чтобы навсегда зафиксировать правильные версии. **Замените блок копирования GEOS** на этот:
+
+```dockerfile
+# Копируем GEOS с ТОЧНЫМИ версиями из образа postgis/postgis:15-3.5
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos_c.so.1.16.2 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos_c.so.1 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos-3.9.0.so /home/yugabyte/postgres/../lib/yb-thirdparty/
+
+# Создаем недостающий симлинк libgeos-3.9.0.so.1 ВНУТРИ финального образа
+RUN cd /home/yugabyte/lib/yb-thirdparty/ && ln -sf libgeos-3.9.0.so libgeos-3.9.0.so.1
+
+# Перелинковываем библиотеки и обновляем кэш
+RUN /home/yugabyte/bin/post_install.sh -e && ldconfig /home/yugabyte/lib/yb-thirdparty/
+```
+
+### 🔍 Если появится ошибка про другую библиотеку (libgdal, libproj и т.д.)
+
+Повторите тот же процесс для каждой новой ошибки:
+1.  Найдите точные имена: `docker run --rm postgis/postgis:15-3.5 bash -c 'ls -la /usr/lib/x86_64-linux-gnu/libназвание.so*'`
+2.  Скопируйте ВСЕ найденные файлы (и реальные библиотеки, и симлинки).
+3.  Добавьте соответствующие строки `COPY` в `Dockerfile`.
+
+**Попробуйте выполнить шаги 1 и 2.** Если сработает — мы наконец получим работающий PostGIS в YugabyteDB! Если будет ошибка о другой библиотеке — покажите её, и мы добавим её копирование.
+
