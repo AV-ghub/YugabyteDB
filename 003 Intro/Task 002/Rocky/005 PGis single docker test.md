@@ -1278,3 +1278,73 @@ RUN /home/yugabyte/bin/post_install.sh -e && ldconfig /home/yugabyte/lib/yb-thir
 
 **Попробуйте выполнить шаги 1 и 2.** Если сработает — мы наконец получим работающий PostGIS в YugabyteDB! Если будет ошибка о другой библиотеке — покажите её, и мы добавим её копирование.
 
+----------------------------------
+--------------------------------
+------------------------------------
+
+```
+проверь пожалуйста, я все правильно понял и написал?
+ERROR:  could not load library "/home/yugabyte/postgres/lib/postgis-3.so": libproj.so.19: cannot open shared object file: No such file or directory
+
+docker rm temp_postgis 2>/dev/null || true
+docker create --name temp_postgis postgis/postgis:15-3.5
+
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libproj.so.19.2.1 /tmp/
+docker cp /tmp/libproj.so.19.2.1 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+docker exec yugabyte-pg bash -c "cd /home/yugabyte/lib/yb-thirdparty/ && ln -sf libproj.so.19 libproj.so.19.2.1"
+
+docker exec yugabyte-pg ldconfig /home/yugabyte/lib/yb-thirdparty/
+docker rm temp_postgis
+
+```
+
+Почти правильно! Вы верно определили, что нужна библиотека `libproj.so.19`, но в коде есть небольшая **логическая ошибка в порядке создания симлинка**.
+
+В вашей команде вы создаёте симлинк `libproj.so.19 -> libproj.so.19.2.1`, но **сначала нужно скопировать исходный симлинк `libproj.so.19`** из контейнера `temp_postgis`. Симлинк — это отдельный файл, который тоже нужно скопировать, а не только создавать вручную.
+
+Вот исправленная последовательность команд:
+
+```bash
+# Удаляем старый временный контейнер и создаем новый
+docker rm temp_postgis 2>/dev/null || true
+docker create --name temp_postgis postgis/postgis:15-3.5
+
+# 1. Копируем ВСЕ файлы libproj: и реальную библиотеку, И СИМЛИНК
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libproj.so.19.2.1 /tmp/
+docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libproj.so.19 /tmp/  # <- Этот шаг добавляем!
+
+# 2. Копируем оба файла в контейнер yugabyte-pg
+docker cp /tmp/libproj.so.19.2.1 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+docker cp /tmp/libproj.so.19 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/  # <- И этот!
+
+# 3. Обновляем кэш библиотек
+docker exec yugabyte-pg ldconfig /home/yugabyte/lib/yb-thirdparty/
+
+# 4. Удаляем временный контейнер
+docker rm temp_postgis
+```
+
+**Важное замечание:** Вам также может понадобиться более старый симлинк `libproj.so` (без номера версии). Проверьте, есть ли он в образе `postgis/postgis`:
+
+```bash
+docker run --rm postgis/postgis:15-3.5 bash -c 'ls -la /usr/lib/x86_64-linux-gnu/libproj.so*'
+```
+
+Если в выводе будет, например, `libproj.so -> libproj.so.19`, то **его тоже нужно скопировать** и добавить соответствующую строку `docker cp`.
+
+### 🚀 После копирования проверьте PostGIS
+```bash
+docker exec -it yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+```
+
+### 📝 Для Dockerfile (когда всё заработает)
+Когда вы убедитесь, что с этими библиотеками PostGIS запускается, добавьте в `Dockerfile` соответствующие строки `COPY`. Например:
+
+```dockerfile
+# Копируем PROJ
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libproj.so.19.2.1 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libproj.so.19 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libproj.so /home/yugabyte/postgres/../lib/yb-thirdparty/  # если существует
+```
+
+**Попробуйте исправленную последовательность команд.** Скорее всего, после добавления PROJ и других библиотек (GDAL, JSON-C и т.д.) PostGIS заработает. Каждую новую ошибку решаем по той же схеме.
