@@ -191,3 +191,120 @@ yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_6
 **Рекомендую начать с Варианта 1.** Он проще и, вероятно, решит проблему.
 
 Если ни один из способов не поможет или возникнут новые ошибки, напишите — будем разбираться дальше.
+
+
+
+--------------------------------------------
+----------------------------------------
+-------------------------------------------
+
+
+```
+нет, все то же
+[]# sed -i 's|^mirrorlist=https|mirrorlist=http|g; s|^#baseurl=http|baseurl=http|g' /etc/yum.repos.d/almalinux*.repo
+[]# yum clean all
+0 files removed
+[]#
+[]#
+[]# yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+AlmaLinux 8 - BaseOS                                                                    [===                                                                                ] ---  B/s |   0  B     --:-- ETA
+AlmaLinux 8 - BaseOS                                                                                                                                                          0.0  B/s |   0  B     00:05
+Errors during downloading metadata for repository 'baseos':
+  - Curl error (60): Peer certificate cannot be authenticated with given CA certificates for https://mirrors.almalinux.org:443/mirrorlist/8/baseos [SSL certificate problem: self signed certificate in certificate chain]
+Error: Failed to download metadata for repo 'baseos': Cannot prepare internal mirrorlist: Curl error (60): Peer certificate cannot be authenticated with given CA certificates for https://mirrors.almalinux.org:443/mirrorlist/8/baseos [SSL certificate problem: self signed certificate in certificate chain]
+[]#
+[]# curl -k -o /tmp/ca-certificates.rpm http://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/Packages/ca-certificates-2023.2.60-80.0.el8.noarch.rpm
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+[]#
+[]# rpm -Uvh /tmp/ca-certificates.rpm --nodeps
+error: /tmp/ca-certificates.rpm: not an rpm package (or package manifest):
+[]#
+[]# update-ca-trust
+[]#
+[]# yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+AlmaLinux 8 - BaseOS                                                                                                                                                          0.0  B/s |   0  B     00:05
+Errors during downloading metadata for repository 'baseos':
+  - Curl error (60): Peer certificate cannot be authenticated with given CA certificates for https://mirrors.almalinux.org:443/mirrorlist/8/baseos [SSL certificate problem: self signed certificate in certificate chain]
+Error: Failed to download metadata for repo 'baseos': Cannot prepare internal mirrorlist: Curl error (60): Peer certificate cannot be authenticated with given CA certificates for https://mirrors.almalinux.org:443/mirrorlist/8/baseos [SSL certificate problem: self signed certificate in certificate chain]
+```
+
+Проблема глубже, чем ожидалось: `curl` скачал пустой файл (0 байт), поэтому `rpm` не смог его установить. Видимо, в контейнере нет нормальной сети или репозитории AlmaLinux недоступны.
+
+Нам нужно **полностью отказаться от установки через yum внутри контейнера** и использовать более прямой подход: скопировать файлы PostGIS **сразу из официального образа `postgis/postgis`** в наш контейнер YugabyteDB.
+
+Этот метод использует механизм **мультистейдж-сборки (multi-stage build)** Docker: мы временно запускаем контейнер с PostGIS, берем оттуда нужные файлы и копируем их в финальный образ.
+
+### 🛠️ Окончательное решение: Мультистейдж-сборка с копированием PostGIS
+
+Создайте новый `Dockerfile` (например, `Dockerfile.postgis.final`) на вашей хост-машине:
+
+```dockerfile
+# Этап 1: Берем официальный образ PostGIS, который собран для PostgreSQL 15
+FROM postgis/postgis:15-3.5 AS postgis_source
+
+# Этап 2: Берем работающий образ YugabyteDB, с которым у вас уже всё получилось
+FROM yugabytedb/yugabyte:2025.2.0.1-b1
+
+# Ключевой шаг: копируем ВСЕ файлы расширения PostGIS из первого контейнера
+# Мы копируем библиотеки (.so файлы) и SQL-скрипты расширений (.sql, .control)
+COPY --from=postgis_source /usr/local/lib/postgresql/postgis*.so /home/yugabyte/postgres/lib/
+COPY --from=postgis_source /usr/local/share/postgresql/extension/postgis* /home/yugabyte/postgres/share/extension/
+
+# Обязательно перелинковываем библиотеки в образе YugabyteDB
+RUN /home/yugabyte/bin/post_install.sh -e
+
+# Опционально: можно сразу создать расширение при запуске контейнера
+# CMD ["/home/yugabyte/bin/yugabyted", "start", "--background=false", "--ysql_enable_auth=false"]
+```
+
+**Почему это должно сработать:**
+*   Мы используем официальный, гарантированно рабочий образ `postgis/postgis`.
+*   Мы не пытаемся что-то скачивать или устанавливать внутри проблемного контейнера.
+*   Мы копируем только конечные файлы библиотек и расширений.
+
+### 🚀 Сборка и запуск нового образа
+
+1.  **Соберите новый образ** на хост-машине:
+    ```bash
+    docker build -f Dockerfile.postgis.final -t yugabyte-with-postgis-final:2025.2 .
+    ```
+
+2.  **Запустите контейнер из нового образа**, освободив порты (например, `5440`):
+    ```bash
+    docker run -d \
+      --name yb-postgis-final \
+      -p 5440:5433 \
+      -p 9045:9042 \
+      -p 7005:7000 \
+      yugabyte-with-postgis-final:2025.2 \
+      /home/yugabyte/bin/yugabyted start --background=false
+    ```
+
+3.  **Дайте контейнеру время на запуск** (1-2 минуты), затем проверьте:
+    ```bash
+    # Подключитесь и создайте расширение
+    docker exec yb-postgis-final /home/yugabyte/bin/ysqlsh -h 172.17.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+    ```
+
+### 🔍 Если при копировании возникнут ошибки (файлы не найдены)
+Пакеты в образе `postgis/postgis` могут лежать в других директориях. Для диагностики можно временно запустить контейнер-источник и посмотреть, что в нем:
+
+```bash
+# Запустите временный контейнер для изучения структуры
+docker run --rm -it postgis/postgis:15-3.5 bash -c "find /usr -name '*postgis*' 2>/dev/null | head -20"
+
+# Вывод покажет правильные пути, например:
+# /usr/local/lib/postgresql/postgis-3.so
+# /usr/local/share/postgresql/extension/postgis.control
+# ...
+```
+
+Если пути отличаются, просто обновите пути `COPY` в `Dockerfile` на те, которые вы увидели в выводе команды `find`.
+
+### 💎 Резюме и следующий шаг
+Проблема сети/репозиториев внутри минималистичного контейнера YugabyteDB оказалась тупиковой. Предложенный метод с мультистейдж1-сборкой — это стандартный и надежный способ добавления функциональности в Docker-образ, когда установка пакетов невозможна.
+
+**Ваш следующий шаг:** Создайте и соберите `Dockerfile.postgis.final` по инструкции выше. Это самый прямой путь к цели.
+
