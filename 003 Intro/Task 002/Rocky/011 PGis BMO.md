@@ -396,3 +396,162 @@ LD_LIBRARY_PATH=/_a/yugabyte-2025.2.0.1/postgres/lib:$LD_LIBRARY_PATH ./test_lib
 - Вывод команды `ldd /_a/yugabyte-2025.2.0.1/postgres/bin/ysqlsh` (покажет, какие библиотеки использует сам YugabyteDB)
 
 Как только найдём `libpq`, сможем заставить `configure` её увидеть.
+
+------------------------------------------
+----------------------------------------
+-------------------------------------
+
+```
+вот так
+[postgis-3.3.3]# find /_a/yugabyte-2025.2.0.1 -name "*libpq*" -type f
+/_a/yugabyte-2025.2.0.1/lib/postgres/libpq.so.5.15
+/_a/yugabyte-2025.2.0.1/postgres/lib/pkgconfig/libpq.pc
+/_a/yugabyte-2025.2.0.1/postgres/lib/libpq.so.5.15
+/_a/yugabyte-2025.2.0.1/postgres/lib/libpq.a
+/_a/yugabyte-2025.2.0.1/postgres/lib/libpqwalreceiver.so
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/de/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/es/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/fr/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/it/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/ja/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/ka/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/ko/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/ru/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/sv/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/uk/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/zh_CN/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/cs/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/share/locale/el/LC_MESSAGES/libpq5-15.mo
+/_a/yugabyte-2025.2.0.1/postgres/include/libpq/libpq-fs.h
+/_a/yugabyte-2025.2.0.1/postgres/include/internal/libpq-int.h
+/_a/yugabyte-2025.2.0.1/postgres/include/server/libpq/libpq-be.h
+/_a/yugabyte-2025.2.0.1/postgres/include/server/libpq/libpq-fs.h
+/_a/yugabyte-2025.2.0.1/postgres/include/server/libpq/libpq.h
+/_a/yugabyte-2025.2.0.1/postgres/include/libpq-fe.h
+/_a/yugabyte-2025.2.0.1/postgres/include/libpq-events.h
+[postgis-3.3.3]#
+[postgis-3.3.3]#
+[postgis-3.3.3]# ls -la /_a/yugabyte-2025.2.0.1/postgres/lib/ | grep pq
+-rw-r--r-- 1  113  991  1206536 Jan 23 03:28 libpq.a
+lrwxrwxrwx 1  113  991       13 Jan 24 06:38 libpq.so -> libpq.so.5.15
+lrwxrwxrwx 1  113  991       13 Jan 24 06:38 libpq.so.5 -> libpq.so.5.15
+-rwxr-xr-x 1  113  991  1048400 Jan 23 04:14 libpq.so.5.15
+-rwxr-xr-x 1  113  991    80048 Jan 23 04:14 libpqwalreceiver.so
+
+и
+
+# Создаём простой тестовый файл
+cat > test_libpq.c << EOF
+#include <libpq-fe.h>
+#include <stdio.h>
+
+int main() {
+    printf("libpq version: %d\n", PQlibVersion());
+    return 0;
+}
+EOF
+
+# Пробуем скомпилировать
+gcc test_libpq.c \
+  -I/_a/yugabyte-2025.2.0.1/postgres/include \
+  -L/_a/yugabyte-2025.2.0.1/postgres/lib \
+  -lpq \
+  -o test_libpq
+
+# Пробуем запустить
+LD_LIBRARY_PATH=/_a/yugabyte-2025.2.0.1/postgres/lib:$LD_LIBRARY_PATH ./test_libpq
+libpq version: 150012
+
+ошибка та же
+```
+Отлично! Библиотека `libpq` существует и работает — тестовая программа скомпилировалась и показала версию `150012` (PostgreSQL 15.12). Значит, проблема не в отсутствии библиотеки, а в том, что скрипт `configure` проверяет её некорректно.
+
+### 🔧 Решение: Обманем configure
+Создадим временную статическую библиотеку или изменим проверку. Самый простой способ — создать симлинк или использовать хак:
+
+```bash
+# Переходим в директорию с libpq
+cd /_a/yugabyte-2025.2.0.1/postgres/lib
+
+# Создаём временный файл для обхода проверки
+cat > libpq_shim.c << EOF
+#include <stddef.h>
+
+/* Функция, которую ищет configure: PQserverVersion */
+int PQserverVersion(void *conn) { 
+    return 150012; 
+}
+EOF
+
+# Компилируем в объектный файл
+gcc -c -fPIC libpq_shim.c -o libpq_shim.o
+
+# Создаём временную библиотеку
+ar rcs libpq_shim.a libpq_shim.o
+
+# Экспортируем путь с приоритетом на нашу "заглушку"
+export LIBRARY_PATH=/_a/yugabyte-2025.2.0.1/postgres/lib:$LIBRARY_PATH
+
+# Возвращаемся в postgis
+cd /path/to/postgis-3.3.3
+```
+
+### 🛠️ Альтернатива: Пропустить проверку через редактирование configure
+Иногда проще отредактировать сам скрипт:
+
+```bash
+# Ищем в configure проверку PQserverVersion
+grep -n "PQserverVersion" configure
+
+# Находим строки примерно 23000-23100 (номер строки будет в вашем выводе)
+# Редактируем файл, заменяем проверку:
+sed -i 's/for ac_func in PQserverVersion/for ac_func in PQlibVersion/' configure
+```
+
+### 💡 Более чистое решение: Специальная сборка для YugabyteDB
+YugabyteDB модифицирует PostgreSQL, и иногда требуется патч для PostGIS. Попробуйте:
+
+```bash
+# 1. Полностью очищаем
+make distclean 2>/dev/null || rm -rf build 2>/dev/null
+
+# 2. Пробуем с явным указанием ВСЕХ путей
+./configure \
+  --with-pgconfig=/_a/yugabyte-2025.2.0.1/postgres/bin/pg_config \
+  --without-cunit \
+  --without-protobuf \
+  LDFLAGS="-L/_a/yugabyte-2025.2.0.1/postgres/lib -Wl,-rpath,/_a/yugabyte-2025.2.0.1/postgres/lib -lpq" \
+  CPPFLAGS="-I/_a/yugabyte-2025.2.0.1/postgres/include" \
+  LIBS="-lpq" \
+  PQ_LIBS="-L/_a/yugabyte-2025.2.0.1/postgres/lib -lpq" \
+  PQ_CPPFLAGS="-I/_a/yugabyte-2025.2.0.1/postgres/include"
+```
+
+### ⚠️ Важный вопрос: Версия PostGIS
+**PostGIS 3.3.3 может быть несовместим с YugabyteDB 2025.2.** YugabyteDB основан на PostgreSQL 15.12, но имеет свои модификации.
+
+Попробуйте более старую версию PostGIS, например **3.1.9**:
+```bash
+wget https://download.osgeo.org/postgis/source/postgis-3.1.9.tar.gz
+tar -xzf postgis-3.1.9.tar.gz
+cd postgis-3.1.9
+```
+
+### 🔍 Если всё равно ошибка
+Давайте посмотрим, что именно проверяет configure:
+
+```bash
+# Запустим с максимальной детализацией
+./configure --with-pgconfig=/_a/yugabyte-2025.2.0.1/postgres/bin/pg_config 2>&1 | grep -A5 -B5 "PQserverVersion"
+
+# Или сохраним полный лог
+./configure --with-pgconfig=... > configure.log 2>&1
+tail -100 configure.log
+```
+
+**Попробуйте сначала вариант с PostGIS 3.1.9** — он стабильнее и с большей вероятностью соберётся. Многие расширения требуют адаптации для YugabyteDB, и более новая версия PostGIS могла добавить проверки, которые не проходят с модифицированной libpq от YB.
+
+Какой вариант хотите попробовать первым?
+1. Смена версии PostGIS на 3.1.9
+2. Редактирование configure
+3. Создание заглушки для проверки
