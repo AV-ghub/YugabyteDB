@@ -1,4 +1,4 @@
-##### [linux](https://download.yugabyte.com/#linux)
+##### [Linux download](https://download.yugabyte.com/#linux)
 ```
 wget https://software.yugabyte.com/releases/2025.2.0.1/yugabyte-2025.2.0.1-b1-linux-x86_64.tar.gz
 tar xvfz yugabyte-2025.2.0.1-b1-linux-x86_64.tar.gz && cd yugabyte-2025.2.0.1/
