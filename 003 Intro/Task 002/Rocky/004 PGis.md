@@ -72,8 +72,8 @@ no configuration file provided: not found
 
 ```bash
 # Создайте директорию для теста
-mkdir ~/yugabyte-test
-cd ~/yugabyte-test
+mkdir yugabyte-test
+cd yugabyte-test
 
 # Создайте простейший docker-compose.yml
 cat > docker-compose.yml << 'EOF'
