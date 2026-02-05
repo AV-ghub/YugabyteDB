@@ -97,3 +97,97 @@ yum install -y postgresql15-server postgis35_15
 > **⚠️ Примечание по безопасности**: Установка криптополитики в `DEFAULT` безопасна для тестовой среды, но в продакшене следует согласовать этот параметр с политиками безопасности вашей организации.
 
 Попробуйте эти шаги внутри контейнера `yugabyte` и сообщите, какой вариант сработал.
+
+-----------------------------------------------
+-------------------------------------------------
+--------------------------------------------
+
+```
+вот так теперь
+[]# yum update
+AlmaLinux 8 - BaseOS                                                                                                                                                          0.0  B/s |   0  B     00:04
+Errors during downloading metadata for repository 'baseos':
+  - Curl error (60): Peer certificate cannot be authenticated with given CA certificates for https://mirrors.almalinux.org/mirrorlist/8/baseos [SSL certificate problem: self signed certificate in certificate chain]
+Error: Failed to download metadata for repo 'baseos': Cannot prepare internal mirrorlist: Curl error (60): Peer certificate cannot be authenticated with given CA certificates for https://mirrors.almalinux.org/mirrorlist/8/baseos [SSL certificate problem: self signed certificate in certificate chain]
+[]#
+[]#
+[]# timedatectl status
+System has not been booted with systemd as init system (PID 1). Can't operate.
+Failed to create bus connection: Host is down
+[]#
+[]#
+[]#
+[]# update-crypto-policies --show
+bash: update-crypto-policies: command not found
+[]#
+[]#
+[]# update-ca-trust
+[]#
+[]#
+[]# update-crypto-policies --set DEFAULT
+bash: update-crypto-policies: command not found
+[]#
+[]#
+[]# yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+AlmaLinux 8 - BaseOS                                                                                                                                                          0.0  B/s |   0  B     00:04
+Errors during downloading metadata for repository 'baseos':
+  - Curl error (60): Peer certificate cannot be authenticated with given CA certificates for https://mirrors.almalinux.org/mirrorlist/8/baseos [SSL certificate problem: self signed certificate in certificate chain]
+Error: Failed to download metadata for repo 'baseos': Cannot prepare internal mirrorlist: Curl error (60): Peer certificate cannot be authenticated with given CA certificates for https://mirrors.almalinux.org/mirrorlist/8/baseos [SSL certificate problem: self signed certificate in certificate chain]
+```
+
+Вы не можете выполнить основные проверки (`timedatectl`, `update-crypto-policies`), потому что в базовом Docker-образе YugabyteDB, скорее всего, нет системы `systemd` и минимального набора системных утилит. Это стандартная практика для оптимизации размера контейнеров.
+
+Основная проблема в том, что в контейнере отсутствуют или устарели корневые SSL-сертификаты (`ca-certificates`), которые нужны для проверки сертификата репозитория AlmaLinux. Без них `yum` не может доверять HTTPS-соединению.
+
+Вот два рабочих обходных пути, начиная с самого простого.
+
+### ⚡ Вариант 1: Быстрый обход — использование HTTP вместо HTTPS
+Самый простой способ — заставить `yum` использовать протокол HTTP для зеркал, где это возможно, минуя проверку SSL.
+
+Внутри контейнера выполните:
+```bash
+# 1. Отредактируйте конфигурацию репозитория baseos
+sed -i 's|^mirrorlist=https|mirrorlist=http|g; s|^#baseurl=http|baseurl=http|g' /etc/yum.repos.d/almalinux*.repo
+
+# 2. Очистите кэш
+yum clean all
+
+# 3. Теперь попробуйте установить пакеты для PostGIS
+yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+```
+
+> ⚠️ **Примечание**: Использование HTTP снижает безопасность, но для быстрой установки пакетов внутри тестового контейнера это допустимо. После установки PostGIS это изменение можно вернуть обратно.
+
+### 🔧 Вариант 2: Установка недостающих пакетов в обход `yum`
+Если Вариант 1 не сработает, можно вручную обновить `ca-certificates`, скачав свежий пакет с репозитория через `curl`.
+
+Выполните в контейнере следующую последовательность команд:
+```bash
+# 1. Скачайте свежий пакет ca-certificates с репозитория AlmaLinux.
+# Используем опцию -k для игнорирования ошибок SSL на этом шаге.
+curl -k -o /tmp/ca-certificates.rpm http://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/Packages/ca-certificates-2023.2.60-80.0.el8.noarch.rpm
+
+# 2. Установите пакет вручную
+rpm -Uvh /tmp/ca-certificates.rpm --nodeps
+
+# 3. Обновите доверенные сертификаты в системе
+update-ca-trust
+
+# 4. Теперь попробуйте снова выполнить yum install для репозитория PostgreSQL
+yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+```
+
+> **Как проверить, что это сработало?** После успешной установки `pgdg-redhat-repo` можно продолжить установку PostGIS, как было в нашем предыдущем плане:
+> 1. `yum install -y postgresql15-server postgis35_15` (или другой версии для pg15).
+> 2. Скопировать файлы PostGIS в каталоги YugabyteDB.
+> 3. Выполнить `/home/yugabyte/bin/post_install.sh -e`.
+
+### 💡 Итог и рекомендация
+| Подход | Суть | Когда использовать |
+| :--- | :--- | :--- |
+| **Вариант 1** | Временно перевести репозиторий `baseos` на HTTP. | Самый быстрый способ для теста. |
+| **Вариант 2** | Вручную обновить пакет `ca-certificates`. | Если Вариант 1 не сработает или нужен более надежный путь. |
+
+**Рекомендую начать с Варианта 1.** Он проще и, вероятно, решит проблему.
+
+Если ни один из способов не поможет или возникнут новые ошибки, напишите — будем разбираться дальше.
