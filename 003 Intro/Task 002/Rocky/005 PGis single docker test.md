@@ -308,3 +308,144 @@ docker run --rm -it postgis/postgis:15-3.5 bash -c "find /usr -name '*postgis*' 
 
 **Ваш следующий шаг:** Создайте и соберите `Dockerfile.postgis.final` по инструкции выше. Это самый прямой путь к цели.
 
+----------------------------------------
+---------------------------------------
+----------------------------------------
+
+
+```
+вот так
+ => ERROR [stage-1 2/4] COPY --from=postgis_source /usr/local/lib/postgresql/postgis*.so /home/yugabyte/postgres/lib/                                                                                    0.0s
+------
+ > [stage-1 2/4] COPY --from=postgis_source /usr/local/lib/postgresql/postgis*.so /home/yugabyte/postgres/lib/:
+------
+Dockerfile.postgis.final:9
+--------------------
+   7 |     # Ключевой шаг: копируем ВСЕ файлы расширения PostGIS из первого контейнера
+   8 |     # Мы копируем библиотеки (.so файлы) и SQL-скрипты расширений (.sql, .control)
+   9 | >>> COPY --from=postgis_source /usr/local/lib/postgresql/postgis*.so /home/yugabyte/postgres/lib/
+  10 |     COPY --from=postgis_source /usr/local/share/postgresql/extension/postgis* /home/yugabyte/postgres/share/extension/
+  11 |
+--------------------
+ERROR: failed to build: failed to solve: lstat /usr/local/lib/postgresql: no such file or directory
+[]#
+[]#
+[]#
+[]# docker run --rm -it postgis/postgis:15-3.5 bash -c "find /usr -name '*postgis*' 2>/dev/null | head -20"
+Unable to find image 'postgis/postgis:15-3.5' locally
+15-3.5: Pulling from postgis/postgis
+ccaf924377f9: Already exists
+
+Digest: sha256:a5c4b91d824b5c5c801891b9d142e8f21274a4250e9e982dfda8a652a23211d6
+Status: Downloaded newer image for postgis/postgis:15-3.5
+/usr/lib/postgresql/15/lib/bitcode/postgis-3
+/usr/lib/postgresql/15/lib/bitcode/postgis-3/postgis_legacy.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis-3/postgis_libprotobuf.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis-3/postgis_module.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis-3.index.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis_raster-3
+/usr/lib/postgresql/15/lib/bitcode/postgis_raster-3/rtpostgis.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis_raster-3.index.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis_sfcgal-3
+/usr/lib/postgresql/15/lib/bitcode/postgis_sfcgal-3/postgis_sfcgal_legacy.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis_sfcgal-3.index.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis_topology-3
+/usr/lib/postgresql/15/lib/bitcode/postgis_topology-3/postgis_topology.bc
+/usr/lib/postgresql/15/lib/bitcode/postgis_topology-3.index.bc
+/usr/lib/postgresql/15/lib/postgis-3.so
+/usr/lib/postgresql/15/lib/postgis_raster-3.so
+/usr/lib/postgresql/15/lib/postgis_sfcgal-3.so
+/usr/lib/postgresql/15/lib/postgis_topology-3.so
+/usr/local/bin/update-postgis.sh
+/usr/share/doc/postgresql-15-postgis-3
+
+что и где нужно поправить?
+```
+
+Отлично, диагностика сработала! Ошибка была в **неправильных путях**. Образ `postgis/postgis` использует структуру каталогов **Debian/Ubuntu**, а мы предполагали универсальную. Теперь мы знаем точные пути.
+
+Ваш `Dockerfile` нужно исправить всего в двух строчках: заменить пути `/usr/local/lib/postgresql/...` и `/usr/local/share/postgresql/...` на те, что показала команда `find`.
+
+### 🛠️ Исправленный Dockerfile
+
+Создайте новый файл или исправьте существующий `Dockerfile.postgis.final`:
+
+```dockerfile
+# Этап 1: Берем официальный образ PostGIS для PostgreSQL 15
+FROM postgis/postgis:15-3.5 AS postgis_source
+
+# Этап 2: Берем работающий образ YugabyteDB
+FROM yugabytedb/yugabyte:2025.2.0.1-b1
+
+# Ключевой шаг: копируем файлы PostGIS из первого контейнера, используя ПРАВИЛЬНЫЕ пути
+# 1. Основные библиотеки (.so файлы) лежат в /usr/lib/postgresql/15/lib/
+COPY --from=postgis_source /usr/lib/postgresql/15/lib/postgis*.so /home/yugabyte/postgres/lib/
+# 2. Файлы расширений (.sql, .control) лежат в /usr/share/postgresql/15/extension/
+COPY --from=postgis_source /usr/share/postgresql/15/extension/postgis* /home/yugabyte/postgres/share/extension/
+
+# Обязательно перелинковываем библиотеки в образе YugabyteDB
+RUN /home/yugabyte/bin/post_install.sh -e
+```
+
+**Почему именно эти пути:**
+*   **Библиотеки (.so)**: Ваш вывод `find` показал: `/usr/lib/postgresql/15/lib/postgis-3.so`
+*   **Расширения**: Путь к файлам расширений обычно симметричен. В Debian/Ubuntu они лежат в `/usr/share/postgresql/<версия>/extension/`
+
+### 🚀 Сборка и запуск
+
+Теперь соберите и запустите исправленный образ:
+
+```bash
+# 1. Соберите образ (убедитесь, что находитесь в директории с Dockerfile)
+docker build -f Dockerfile.postgis.final -t yugabyte-with-postgis-final:2025.2 .
+
+# 2. Остановите старый контейнер, если он мешает, и запустите новый
+docker stop yugabyte 2>/dev/null || true
+docker rm yugabyte 2>/dev/null || true
+
+docker run -d \
+  --name yugabyte-pg \
+  -p 5435:5433 \
+  -p 9045:9042 \
+  -p 7005:7000 \
+  yugabyte-with-postgis-final:2025.2 \
+  /home/yugabyte/bin/yugabyted start --background=false
+
+# 3. Дайте время на запуск (1-2 минуты) и проверьте
+sleep 90
+docker exec yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.17.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+```
+
+### ⚠️ Возможная проблема и её решение
+
+Если после сборки при создании расширения возникнет ошибка вида `"could not load library..."`, это может означать, что библиотекам PostGIS не хватает их собственных зависимостей внутри образа YugabyteDB (например, `libjson-c`, `libprotobuf-c`, `libgdal`).
+
+**Решение: копируем зависимости из образа PostGIS**
+Можно расширить `Dockerfile`, чтобы скопировать все возможные недостающие библиотеки:
+
+```dockerfile
+# ... предыдущие этапы без изменений ...
+
+FROM yugabytedb/yugabyte:2025.2.0.1-b1
+
+# Копируем основные библиотеки PostGIS
+COPY --from=postgis_source /usr/lib/postgresql/15/lib/postgis*.so /home/yugabyte/postgres/lib/
+COPY --from=postgis_source /usr/share/postgresql/15/extension/postgis* /home/yugabyte/postgres/share/extension/
+
+# ДОПОЛНИТЕЛЬНО: копируем возможные системные зависимости PostGIS
+# Создаем директорию для сторонних библиотек YugabyteDB и копируем туда распространенные зависимости
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libjson-c.so* /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libprotobuf-c.so* /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgdal.so* /home/yugabyte/postgres/../lib/yb-thirdparty/
+# Можно добавить другие библиотеки, если известны конкретные ошибки
+
+# Перелинковка
+RUN /home/yugabyte/bin/post_install.sh -e
+```
+
+### 💎 Итог
+**Исправьте пути в `COPY`-инструкциях**, как показано выше, и соберите образ заново. Это должно решить проблему.
+
+Если после этого при создании расширения возникнут новые ошибки о **зависимостях библиотек**, примените расширенное решение с копированием системных библиотек.
+
+Попробуйте исправленный Dockerfile и сообщите о результате.
