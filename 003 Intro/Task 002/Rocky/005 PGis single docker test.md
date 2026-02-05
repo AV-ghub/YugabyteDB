@@ -984,3 +984,141 @@ docker logs yugabyte-pg --tail 50
 ```
 
 После выполнения этих команд у нас будет четкая картина. Покажите их вывод, и я помогу определить, в чем именно причина и как её устранить: возможно, потребуется перезапустить кластер с дополнительным флагом `--listen`  или внести исправление в конфигурацию.
+
+
+----------------------------
+---------------------------
+-----------------------
+
+```
+ну вот что удалось накопать
+[]# docker exec yugabyte-pg /home/yugabyte/bin/yugabyted status
+
++--------------------------------------------------------------------------------------------------+
+|                                            yugabyted                                             |
++--------------------------------------------------------------------------------------------------+
+| Status     : Running.                                                                            |
+| YSQL Status: Ready                                                                               |
+| Replication Factor: 1                                                                                   |
+| YugabyteDB UI: http://b18708511687:15433                                                           |
+| JDBC       : jdbc:postgresql://b18708511687:5433/yugabyte?user=yugabyte&password=yugabyte        |
+| YSQL       : bin/ysqlsh -h b18708511687  -U yugabyte -d yugabyte                                 |
+| YCQL       : bin/ycqlsh b18708511687 9042 -u cassandra                                           |
+| Data Dir   : /root/var/data                                                                      |
+| Log Dir    : /root/var/logs                                                                      |
+| Universe UUID: 566eabfd-f304-4019-8a03-c0ad2f739c15                                                |
++--------------------------------------------------------------------------------------------------+
+[]#
+[]#
+[]#
+[]# docker exec yugabyte-pg bash -c "hostname -I && echo '---' && netstat -tlnp | grep 5433"
+172.16.0.2
+---
+tcp        0      0 172.16.0.2:15433        0.0.0.0:*               LISTEN      297/yugabyted-ui
+tcp        0      0 172.16.0.2:5433         0.0.0.0:*               LISTEN      316/postgres
+[]#
+[]#
+[]# docker ps
+CONTAINER ID   IMAGE                                COMMAND                  CREATED         STATUS         PORTS                                                                                                                                                                                                                                 NAMES
+b18708511687   yugabyte-with-postgis-final:2025.2   "/sbin/tini -- /home…"   5 minutes ago   Up 5 minutes   6379/tcp, 7100/tcp, 7200/tcp, 9000/tcp, 9100/tcp, 10100/tcp, 11000/tcp, 12000/tcp, 18018/tcp, 0.0.0.0:5435->5433/tcp, [::]:5435->5433/tcp, 0.0.0.0:7005->7000/tcp, [::]:7005->7000/tcp, 0.0.0.0:9045->9042/tcp, [::]:9045->9042/tcp   yugabyte-pg
+[]#
+[]#
+[]#
+[]# docker logs yugabyte-pg --tail 50
+Starting yugabyted...
+✅ YugabyteDB Started
+✅ UI ready
+✅ Data placement constraint successfully verified
+[]# docker exec yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte
+[]#
+[]#
+[]# docker exec -it yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte
+ysqlsh (15.12-YB-2025.2.0.1-b0)
+Type "help" for help.
+
+yugabyte=# CREATE EXTENSION postgis;
+ERROR:  could not load library "/home/yugabyte/postgres/lib/postgis-3.so": libgeos_c.so.1: cannot open shared object file: No such file or directory
+yugabyte=#
+```
+
+Превосходно! **Мы решили проблему сети**. Как видим из вывода:
+1.  Кластер работает (`yugabyted status: Running`).
+2.  IP-адрес контейнера (`172.16.0.2`) совпадает с тем, на котором слушает `postgres` (`172.16.0.2:5433`).
+3.  Подключение `ysqlsh` успешно — мы смогли зайти в интерактивный терминал.
+
+Теперь **последний барьер** — всё та же ошибка с зависимостью `libgeos_c.so.1`. Это означает, что наши библиотеки в `/home/yugabyte/postgres/../lib/yb-thirdparty/` не были корректно распознаны системой. Скорее всего, проблема в том, что **симлинки (символические ссылки) внутри архива могли не сохраниться или не развернуться должным образом**, либо система не обновила кэш библиотек.
+
+Давайте это исправим двумя проверенными способами.
+
+### 🔧 Способ 1: Явное копирование цепочек библиотек
+Это самый надежный способ, но требует немного больше кода в `Dockerfile`. Мы копируем не по маске, а конкретные файлы, обеспечивая целостность симлинков.
+
+Замените в вашем `Dockerfile` блок с `find`/`tar` на следующий (обратите внимание на форматирование, каждая строка `COPY` — это отдельная библиотека и её симлинки):
+
+```dockerfile
+# Этап 1: Берем официальный образ PostGIS для PostgreSQL 15
+FROM postgis/postgis:15-3.5 AS postgis_source
+
+# Этап 2: Берем работающий образ YugabyteDB
+FROM yugabytedb/yugabyte:2025.2.0.1-b1
+
+# Копируем файлы PostGIS из первого контейнера
+COPY --from=postgis_source /usr/lib/postgresql/15/lib/postgis*.so /home/yugabyte/postgres/lib/
+COPY --from=postgis_source /usr/share/postgresql/15/extension/postgis* /home/yugabyte/postgres/share/extension/
+
+# ВАЖНО: Явно копируем ВСЕ необходимые библиотеки и их симлинки в нужную директорию
+# Копируем GEOS (геометрическую библиотеку)
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos_c.so.1.17.2 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos_c.so.1 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos-3.9.0.so.1.17.2 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos-3.9.0.so.1 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgeos-3.9.0.so /home/yugabyte/postgres/../lib/yb-thirdparty/
+# Копируем другие частые зависимости (копируем основной файл и его основные симлинки)
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgdal.so.32.3.9.0 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libgdal.so.32 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libproj.so.25.9.1.0 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libproj.so.25 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libjson-c.so.5.2.0 /home/yugabyte/postgres/../lib/yb-thirdparty/
+COPY --from=postgis_source /usr/lib/x86_64-linux-gnu/libjson-c.so.5 /home/yugabyte/postgres/../lib/yb-thirdparty/
+
+# Обязательно перелинковываем библиотеки в образе YugabyteDB
+RUN /home/yugabyte/bin/post_install.sh -e
+
+# ДОПОЛНИТЕЛЬНЫЙ ШАГ: Явно обновляем кэш динамических библиотек (ldconfig)
+RUN ldconfig /home/yugabyte/lib/yb-thirdparty/
+```
+
+### 🔍 Проверка наличия файлов в контейнере (перед пересборкой)
+Прежде чем пересобирать, убедитесь, что файлы, которые мы планируем копировать, действительно существуют в образе `postgis_source`. Выполните на хост-машине:
+```bash
+docker run --rm postgis/postgis:15-3.5 bash -c 'ls -la /usr/lib/x86_64-linux-gnu/libgeos_c.so* /usr/lib/x86_64-linux-gnu/libgeos-3.9.0.so*'
+```
+Если путь к файлам будет другим (например, версия `libgeos_c.so.1.18.0`), **обновите соответствующие строки `COPY` в Dockerfile**.
+
+### 🚀 Способ 2: Альтернатива — использование Docker `bind mount` для теста
+Если вы хотите быстро протестировать, не пересобирая образ, можно напрямую "подмонтировать" недостающую библиотеку из образа `postgis/postgis` в запущенный контейнер.
+
+1.  **Создайте временный контейнер `postgis` и извлеките из него библиотеку**:
+    ```bash
+    # Создаем временный контейнер и копируем из него библиотеку на хост
+    docker create --name temp_postgis postgis/postgis:15-3.5
+    docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos_c.so.1 /tmp/libgeos_c.so.1
+    docker cp temp_postgis:/usr/lib/x86_64-linux-gnu/libgeos_c.so.1.17.2 /tmp/libgeos_c.so.1.17.2
+    docker rm temp_postgis
+    ```
+2.  **Скопируйте библиотеки в запущенный контейнер `yugabyte-pg`**:
+    ```bash
+    docker cp /tmp/libgeos_c.so.1 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+    docker cp /tmp/libgeos_c.so.1.17.2 yugabyte-pg:/home/yugabyte/lib/yb-thirdparty/
+    docker exec yugabyte-pg bash -c "cd /home/yugabyte/lib/yb-thirdparty/ && ln -sf libgeos_c.so.1.17.2 libgeos_c.so.1"
+    docker exec yugabyte-pg ldconfig /home/yugabyte/lib/yb-thirdparty/
+    ```
+3.  **Попробуйте снова создать расширение**:
+    ```bash
+    docker exec -it yugabyte-pg /home/yugabyte/bin/ysqlsh -h 172.16.0.2 -p 5433 -U yugabyte -c "CREATE EXTENSION postgis; SELECT PostGIS_Full_Version();"
+    ```
+
+### 💡 Рекомендация
+**Начните со Способа 2**. Это быстрый тест, который подтвердит, что проблема именно в этой конкретной библиотеке и её симлинках. Если он сработает, вы сможете сразу протестировать PostGIS. Затем для создания постоянного решения **используйте исправленный Dockerfile из Способа 1**, чтобы образ был готов к любому развертыванию.
+
+Попробуйте Способ 2 и сообщите результат. Если снова будет ошибка о другой библиотеке — мы добавим её в список для копирования.
