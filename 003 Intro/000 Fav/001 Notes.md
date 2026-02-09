@@ -63,6 +63,42 @@ docker exec -it <имя> /bin/bash
 docker ps -a	
 Показывает все контейнеры (и запущенные, и остановленные).
 
+```
+# docker --version
+Docker version 20.10.17, build 100c701
+ 
+# docker compose --version
+Docker version 20.10.17, build 100c701
+ 
+# Действующие артефакты докера
+ 
+# docker ps
+CONTAINER ID   IMAGE                                                          COMMAND                  CREATED       STATUS       PORTS                                                     NAMES
+ 
+# docker-compose ps
+Name Command State Ports
+```
+
+##  Проверяем сети Docker
+```
+docker network ls
+docker network inspect yugabyte_default
+docker exec yugabyte_yb-tserver1_1 netstat -tln # Контейнер может слушать на своих портах
+# 1. Просмотр всех контейнеров и их сетей
+docker ps --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}"
+
+```
+
+#  Проверяем параметры системы
+```
+cat /etc/os-release
+hostnamectl
+hostname -I
+uname -a
+netstat -tln
+ss -tlnp | grep docker
+```
+
 
 
 
